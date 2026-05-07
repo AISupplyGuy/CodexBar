@@ -1061,8 +1061,23 @@ extension ClaudeUsageFetcher {
                     }
                 }
             // Only merge usage/cost extras; keep identity fields from the primary data source.
-            let mergedExtraRateWindows = snapshot.extraRateWindows.isEmpty ? webData.extraRateWindows : snapshot
-                .extraRateWindows
+            // Per-window upgrade: when the OAuth snapshot has a placeholder (utilization 0, no reset
+            // — produced when the API returns a known key with a null payload) and the web endpoint
+            // has a populated window with the same id, prefer the web value. This handles cases like
+            // `seven_day_cowork` (Routines) where OAuth lags behind the claude.ai dashboard.
+            let mergedExtraRateWindows: [NamedRateWindow] = {
+                if snapshot.extraRateWindows.isEmpty { return webData.extraRateWindows }
+                let webById = Dictionary(uniqueKeysWithValues: webData.extraRateWindows.map { ($0.id, $0) })
+                return snapshot.extraRateWindows.map { existing in
+                    guard
+                        existing.window.usedPercent == 0,
+                        existing.window.resetsAt == nil,
+                        let webWindow = webById[existing.id],
+                        webWindow.window.usedPercent > 0 || webWindow.window.resetsAt != nil
+                    else { return existing }
+                    return webWindow
+                }
+            }()
             let mergedProviderCost = snapshot.providerCost ?? webData.extraUsageCost
             if mergedProviderCost != snapshot.providerCost || mergedExtraRateWindows != snapshot.extraRateWindows {
                 return ClaudeUsageSnapshot(

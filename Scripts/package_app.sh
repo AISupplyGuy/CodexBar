@@ -188,7 +188,9 @@ for ARCH in "${ARCH_LIST[@]}"; do
   swift build -c "$CONF" --arch "$ARCH"
 done
 
-APP="$ROOT/CodexBar.app"
+APP_OUT_DIR="${CODEXBAR_APP_OUT_DIR:-$ROOT}"
+mkdir -p "$APP_OUT_DIR"
+APP="$APP_OUT_DIR/CodexBar.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Frameworks"
 mkdir -p "$APP/Contents/Helpers" "$APP/Contents/PlugIns"
@@ -404,6 +406,9 @@ else
   CODESIGN_ARGS=(--force --timestamp --options runtime --sign "$CODESIGN_ID")
 fi
 function resign() { codesign "${CODESIGN_ARGS[@]}" "$1"; }
+  # Strip attributes before signing nested Sparkle components (Updater.app can carry Finder detritus).
+  xattr -cr "$SPARKLE" || true
+  find "$SPARKLE" -name '._*' -delete
   # Sign innermost binaries first, then the framework root to seal resources
   resign "$SPARKLE"
   resign "$SPARKLE/Versions/B/Sparkle"
