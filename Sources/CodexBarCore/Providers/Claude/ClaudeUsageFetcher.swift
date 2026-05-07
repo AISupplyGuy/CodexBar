@@ -10,6 +10,7 @@ public struct ClaudeUsageSnapshot: Sendable {
     public let primary: RateWindow
     public let secondary: RateWindow?
     public let opus: RateWindow?
+    public let extraRateWindows: [NamedRateWindow]
     public let providerCost: ProviderCostSnapshot?
     public let updatedAt: Date
     public let accountEmail: String?
@@ -21,6 +22,7 @@ public struct ClaudeUsageSnapshot: Sendable {
         primary: RateWindow,
         secondary: RateWindow?,
         opus: RateWindow?,
+        extraRateWindows: [NamedRateWindow] = [],
         providerCost: ProviderCostSnapshot? = nil,
         updatedAt: Date,
         accountEmail: String?,
@@ -31,6 +33,7 @@ public struct ClaudeUsageSnapshot: Sendable {
         self.primary = primary
         self.secondary = secondary
         self.opus = opus
+        self.extraRateWindows = extraRateWindows
         self.providerCost = providerCost
         self.updatedAt = updatedAt
         self.accountEmail = accountEmail
@@ -841,6 +844,7 @@ extension ClaudeUsageFetcher {
         let modelSpecific = makeWindow(
             usage.sevenDaySonnet ?? usage.sevenDayOpus,
             windowMinutes: 7 * 24 * 60)
+        let extraRateWindows = Self.oauthExtraRateWindows(from: usage)
 
         let loginMethod = ClaudePlan.oauthLoginMethod(rateLimitTier: credentials.rateLimitTier)
         let providerCost = Self.oauthExtraUsageCost(usage.extraUsage, loginMethod: loginMethod)
@@ -849,6 +853,7 @@ extension ClaudeUsageFetcher {
             primary: primary,
             secondary: weekly,
             opus: modelSpecific,
+            extraRateWindows: extraRateWindows,
             providerCost: providerCost,
             updatedAt: Date(),
             accountEmail: nil,
@@ -885,6 +890,50 @@ extension ClaudeUsageFetcher {
         // Always convert to dollars (major units) for display consistency.
         // See: ClaudeWebAPIFetcher.swift which always divides by 100.
         (used: used / 100.0, limit: limit / 100.0)
+    }
+
+    private static func oauthExtraRateWindows(from usage: OAuthUsageResponse) -> [NamedRateWindow] {
+        let definitions: [(id: String, title: String, window: OAuthUsageWindow?, sourceKey: String?)] = [
+            (
+                id: "claude-design",
+                title: "Designs",
+                window: usage.sevenDayDesign,
+                sourceKey: usage.sevenDayDesignSourceKey),
+            (
+                id: "claude-routines",
+                title: "Daily Routines",
+                window: usage.sevenDayRoutines,
+                sourceKey: usage.sevenDayRoutinesSourceKey),
+        ]
+        if let designKey = usage.sevenDayDesignSourceKey {
+            Self.log.debug("Claude OAuth extra usage key matched: design=\(designKey)")
+        }
+        if let routinesKey = usage.sevenDayRoutinesSourceKey {
+            Self.log.debug("Claude OAuth extra usage key matched: routines=\(routinesKey)")
+        }
+        return definitions.compactMap { definition in
+            let utilization: Double
+            let resetDate: Date?
+            if let window = definition.window, let parsedUtilization = window.utilization {
+                utilization = parsedUtilization
+                resetDate = ClaudeOAuthUsageFetcher.parseISO8601Date(window.resetsAt)
+            } else if definition.sourceKey != nil {
+                // Keep product bars visible when the API returns a known key with null payload.
+                utilization = 0
+                resetDate = nil
+            } else {
+                return nil
+            }
+            let resetDescription = resetDate.map(Self.formatResetDate)
+            return NamedRateWindow(
+                id: definition.id,
+                title: definition.title,
+                window: RateWindow(
+                    usedPercent: utilization,
+                    windowMinutes: Self.weeklyWindowMinutes,
+                    resetsAt: resetDate,
+                    resetDescription: resetDescription))
+        }
     }
 
     // MARK: - Web API path (uses browser cookies)
@@ -927,6 +976,7 @@ extension ClaudeUsageFetcher {
             primary: primary,
             secondary: secondary,
             opus: opus,
+            extraRateWindows: webData.extraRateWindows,
             providerCost: webData.extraUsageCost,
             updatedAt: Date(),
             accountEmail: webData.accountEmail,
@@ -986,6 +1036,7 @@ extension ClaudeUsageFetcher {
             primary: primary,
             secondary: weekly,
             opus: opus,
+            extraRateWindows: [],
             providerCost: nil,
             updatedAt: Date(),
             accountEmail: snap.accountEmail,
@@ -1009,13 +1060,32 @@ extension ClaudeUsageFetcher {
                         Self.log.debug(msg)
                     }
                 }
-            // Only merge cost extras; keep identity fields from the primary data source.
-            if snapshot.providerCost == nil, let extra = webData.extraUsageCost {
+            // Only merge usage/cost extras; keep identity fields from the primary data source.
+            // Per-window upgrade: when the OAuth snapshot has a placeholder (utilization 0, no reset
+            // — produced when the API returns a known key with a null payload) and the web endpoint
+            // has a populated window with the same id, prefer the web value. This handles cases like
+            // `seven_day_cowork` (Routines) where OAuth lags behind the claude.ai dashboard.
+            let mergedExtraRateWindows: [NamedRateWindow] = {
+                if snapshot.extraRateWindows.isEmpty { return webData.extraRateWindows }
+                let webById = Dictionary(uniqueKeysWithValues: webData.extraRateWindows.map { ($0.id, $0) })
+                return snapshot.extraRateWindows.map { existing in
+                    guard
+                        existing.window.usedPercent == 0,
+                        existing.window.resetsAt == nil,
+                        let webWindow = webById[existing.id],
+                        webWindow.window.usedPercent > 0 || webWindow.window.resetsAt != nil
+                    else { return existing }
+                    return webWindow
+                }
+            }()
+            let mergedProviderCost = snapshot.providerCost ?? webData.extraUsageCost
+            if mergedProviderCost != snapshot.providerCost || mergedExtraRateWindows != snapshot.extraRateWindows {
                 return ClaudeUsageSnapshot(
                     primary: snapshot.primary,
                     secondary: snapshot.secondary,
                     opus: snapshot.opus,
-                    providerCost: extra,
+                    extraRateWindows: mergedExtraRateWindows,
+                    providerCost: mergedProviderCost,
                     updatedAt: snapshot.updatedAt,
                     accountEmail: snapshot.accountEmail,
                     accountOrganization: snapshot.accountOrganization,
